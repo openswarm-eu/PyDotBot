@@ -110,3 +110,9 @@ tox
 [pydotbot-overview]: https://github.com/DotBots/PyDotBot/blob/main/dotbots.png?raw=True
 [dotbot-firmware-repo]: https://github.com/DotBots/DotBot-firmware
 [dotbot-pcb-repo]: https://github.com/DotBots/DotBot-hardware
+
+# Acknowledgement
+
+Part of the source code in this repository is developed within the frame and for the purpose of the OpenSwarm project. This project has received funding from the European Unioan's Horizon Europe Framework Programme under Grant Agreement No. 101093046.
+
+![OpenSwarm - Funded by the European Union](logos/ack.png)
