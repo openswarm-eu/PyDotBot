@@ -85,9 +85,6 @@ const server = setupServer(
         });
         return res();
     }),
-    rest.get('/controller/lh2/calibration', (req, res, ctx) => {
-        return res(ctx.json({state: "done"}));
-    }),
     rest.put('/controller/dotbots/:address/:application/move_raw', (req, res, ctx) => {
         return res();
     }),
@@ -105,7 +102,7 @@ test('DotBots main page', async () => {
     await waitFor(() => expect(screen.getByText("Available DotBots")).toBeVisible());
     await waitFor(() => expect(screen.getByText("Available SailBots")).toBeVisible());
 
-    await user.click(screen.getAllByText('alive')[0]);
+    await user.click(screen.getAllByText('active')[0]);
     await new Promise(r => setTimeout(r, 100));
     expect(currentActive).toEqual("2020");
 

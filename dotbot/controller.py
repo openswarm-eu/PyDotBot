@@ -10,17 +10,20 @@
 import asyncio
 import json
 import math
+import os
 import time
 import webbrowser
 from binascii import hexlify
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 import serial
 import uvicorn
 import websockets
+from dotbot_utils.protocol import Frame, Payload
+from dotbot_utils.serial_interface import SerialInterfaceException
 from fastapi import WebSocket
-from haversine import Unit, haversine
 from pydantic import ValidationError
 from pydantic.tools import parse_obj_as
 from qrkey import QrkeyController, SubscriptionModel, qrkey_settings
@@ -35,18 +38,19 @@ from dotbot import (
     NETWORK_ID_DEFAULT,
     SERIAL_BAUDRATE_DEFAULT,
     SERIAL_PORT_DEFAULT,
+    SIMULATOR_INIT_STATE_PATH_DEFAULT,
 )
 from dotbot.adapter import (
+    DotBotSimulatorAdapter,
     GatewayAdapterBase,
     MarilibCloudAdapter,
     MarilibEdgeAdapter,
+    SailBotSimulatorAdapter,
     SerialAdapter,
 )
-from dotbot.lighthouse2 import LighthouseManager, LighthouseManagerState
 from dotbot.logger import LOGGER
 from dotbot.models import (
     MAX_POSITION_HISTORY_SIZE,
-    DotBotCalibrationIndexModel,
     DotBotGPSPosition,
     DotBotLH2Position,
     DotBotModel,
@@ -65,18 +69,16 @@ from dotbot.models import (
 )
 from dotbot.protocol import (
     ApplicationType,
-    Frame,
-    Payload,
     PayloadCommandMoveRaw,
     PayloadCommandRgbLed,
     PayloadCommandXgoAction,
     PayloadGPSPosition,
     PayloadGPSWaypoints,
+    PayloadLh2CalibrationHomography,
     PayloadLH2Location,
     PayloadLH2Waypoints,
     PayloadType,
 )
-from dotbot.serial_interface import SerialInterfaceException
 from dotbot.server import api
 
 # from dotbot.models import (
@@ -88,10 +90,22 @@ from dotbot.server import api
 
 
 CONTROLLERS = {}
-LOST_DELAY = 5  # seconds
-DEAD_DELAY = 60  # seconds
+INACTIVE_DELAY = 5  # seconds
+LOST_DELAY = 60  # seconds
 LH2_POSITION_DISTANCE_THRESHOLD = 0.01
 GPS_POSITION_DISTANCE_THRESHOLD = 5  # meters
+CALIBRATION_PATH = Path.home() / ".dotbot" / "calibration.out"
+
+
+def load_calibration() -> PayloadLh2CalibrationHomography:
+    if not os.path.exists(CALIBRATION_PATH):
+        return None
+    with open(CALIBRATION_PATH, "rb") as calibration_file:
+        index = int.from_bytes(calibration_file.read(4), "little", signed=False)
+        homography_matrix = calibration_file.read(36)
+    return PayloadLh2CalibrationHomography(
+        index=index, homography_matrix=homography_matrix
+    )
 
 
 class ControllerException(Exception):
@@ -114,6 +128,9 @@ class ControllerSettings:
     controller_http_port: int = CONTROLLER_HTTP_PORT_DEFAULT
     webbrowser: bool = False
     verbose: bool = False
+    log_level: str = "info"
+    log_output: str = os.path.join(os.getcwd(), "pydotbot.log")
+    simulator_init_state_path: str = SIMULATOR_INIT_STATE_PATH_DEFAULT
 
 
 def lh2_distance(last: DotBotLH2Position, new: DotBotLH2Position) -> float:
@@ -123,9 +140,22 @@ def lh2_distance(last: DotBotLH2Position, new: DotBotLH2Position) -> float:
 
 def gps_distance(last: DotBotGPSPosition, new: DotBotGPSPosition) -> float:
     """Helper function that computes the distance between 2 GPS positions in m."""
-    return haversine(
-        (last.latitude, last.longitude), (new.latitude, new.longitude), unit=Unit.METERS
+    # Simple haversine formula implementation
+    lat1, lon1 = math.radians(last.latitude), math.radians(last.longitude)
+    lat2, lon2 = math.radians(new.latitude), math.radians(new.longitude)
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     )
+    c = 2 * math.asin(math.sqrt(a))
+
+    # Earth's radius in meters
+    earth_radius = 6371000
+    return earth_radius * c
 
 
 class Controller:
@@ -163,8 +193,7 @@ class Controller:
         self.settings = settings
         self.adapter: GatewayAdapterBase = None
         self.websockets = []
-        self.lh2_manager = LighthouseManager()
-
+        self.lh2_calibration = load_calibration()
         self.api = api
         api.controller = self
         self.qrkey = None
@@ -186,8 +215,6 @@ class Controller:
                 topic="/command/+/+/+/clear_position_history",
                 callback=self.on_command_clear_position_history,
             ),
-            SubscriptionModel(topic="/lh2/add", callback=self.on_lh2_add),
-            SubscriptionModel(topic="/lh2/start", callback=self.on_lh2_start),
         ]
 
     def on_command_move_raw(self, topic, payload):
@@ -375,33 +402,6 @@ class Controller:
             ),
         )
 
-    def on_lh2_add(self, topic, payload):
-        """Called when an lh2 calibration point is added."""
-        logger = self.logger.bind(lh2="add", topic=topic)
-        topic_split = topic.split("/")[1:]
-        if len(topic_split) != 2 or topic_split[-1] != "add":
-            logger.warning("Invalid lh2 add topic")
-            return
-        try:
-            payload = DotBotCalibrationIndexModel(**payload)
-        except ValidationError as exc:
-            self.logger.warning(f"Invalid calibration index payload: {exc.errors()}")
-            return
-        logger = self.logger.bind(**payload.model_dump())
-        logger.info("Add calibration point")
-        self.lh2_manager.add_calibration_point(payload.index)
-
-    def on_lh2_start(self, topic, _):
-        """Called to start the lh2 calibration."""
-        logger = self.logger.bind(lh2="start", topic=topic)
-        topic_split = topic.split("/")[1:]
-        if len(topic_split) != 2 or topic_split[-1] != "start":
-            logger.warning("Invalid lh2 start topic")
-            return
-        logger.info("Start calibration")
-        self.lh2_manager.compute_calibration()
-        logger.info("Calibration complete")
-
     def on_request(self, payload):
         logger = LOGGER.bind(topic="/request")
         logger.info("Request received", **payload)
@@ -421,13 +421,6 @@ class Controller:
             message = DotBotReplyModel(
                 request=DotBotRequestType.DOTBOTS,
                 data=data,
-            ).model_dump(exclude_none=True)
-            self.qrkey.publish(reply_topic, message)
-        elif request.request == DotBotRequestType.LH2_CALIBRATION_STATE:
-            logger.info("Publish LH2 state")
-            message = DotBotReplyModel(
-                request=DotBotRequestType.LH2_CALIBRATION_STATE,
-                data=self.lh2_manager.state_model.model_dump(),
             ).model_dump(exclude_none=True)
             self.qrkey.publish(reply_topic, message)
         else:
@@ -468,12 +461,12 @@ class Controller:
             needs_refresh = [False] * len(self.dotbots)
             for idx, dotbot in enumerate(self.dotbots.values()):
                 previous_status = dotbot.status
-                if dotbot.last_seen + DEAD_DELAY < time.time():
-                    dotbot.status = DotBotStatus.DEAD
-                elif dotbot.last_seen + LOST_DELAY < time.time():
+                if dotbot.last_seen + LOST_DELAY < time.time():
                     dotbot.status = DotBotStatus.LOST
+                elif dotbot.last_seen + INACTIVE_DELAY < time.time():
+                    dotbot.status = DotBotStatus.INACTIVE
                 else:
-                    dotbot.status = DotBotStatus.ALIVE
+                    dotbot.status = DotBotStatus.ACTIVE
                 logger = self.logger.bind(
                     source=dotbot.address,
                     application=dotbot.application.name,
@@ -516,10 +509,10 @@ class Controller:
         )
         notification_cmd = DotBotNotificationCommand.NONE
 
-        if (
-            source not in self.dotbots
-            and frame.packet.payload_type != PayloadType.ADVERTISEMENT
-        ):
+        if source not in self.dotbots and frame.packet.payload_type not in [
+            PayloadType.ADVERTISEMENT,
+            PayloadType.DOTBOT_ADVERTISEMENT,
+        ]:
             logger.info("Ignoring non advertised dotbot")
             return
 
@@ -537,35 +530,63 @@ class Controller:
             dotbot.waypoints = self.dotbots[source].waypoints
             dotbot.waypoints_threshold = self.dotbots[source].waypoints_threshold
             dotbot.position_history = self.dotbots[source].position_history
+            dotbot.battery = self.dotbots[source].battery
+            dotbot.calibrated = self.dotbots[source].calibrated
         else:
             # reload if a new dotbot comes in
-            logger.info("New dotbot")
+            logger.info("New robot")
             notification_cmd = DotBotNotificationCommand.RELOAD
 
         if frame.packet.payload_type == PayloadType.ADVERTISEMENT:
             logger = logger.bind(
                 application=ApplicationType(frame.packet.payload.application).name,
-                calibrated=bool(frame.packet.payload.calibrated),
             )
             dotbot.application = ApplicationType(frame.packet.payload.application)
-            dotbot.calibrated = bool(frame.packet.payload.calibrated)
             self.dotbots.update({dotbot.address: dotbot})
             logger.debug("Advertisement received")
+
+        if frame.packet.payload_type == PayloadType.DOTBOT_ADVERTISEMENT:
+            logger = logger.bind(application=ApplicationType.DotBot.name)
+            dotbot.calibrated = bool(frame.packet.payload.calibrated)
+            logger.info("Advertisement received", calibrated=bool(dotbot.calibrated))
             # Send calibration to dotbot if it's not calibrated and the localization system has calibration
-            if (
-                dotbot.calibrated is False
-                and self.lh2_manager.state == LighthouseManagerState.Calibrated
-            ):
+            need_update = False
+            if dotbot.calibrated is False and self.lh2_calibration is not None:
                 # Send calibration to new dotbot if the localization system is calibrated
-                self.logger.info(
-                    "Send calibration data", payload=self.lh2_manager.calibration
-                )
+                self.logger.info("Send calibration data", payload=self.lh2_calibration)
                 self.dotbots.update({dotbot.address: dotbot})
-                self.send_payload(int(source, 16), payload=self.lh2_manager.calibration)
+                self.send_payload(int(source, 16), payload=self.lh2_calibration)
+            elif dotbot.calibrated is True:
+                if frame.packet.payload.direction != 0xFFFF:
+                    dotbot.direction = frame.packet.payload.direction
+                new_position = DotBotLH2Position(
+                    x=frame.packet.payload.pos_x / 1e6,
+                    y=frame.packet.payload.pos_y / 1e6,
+                    z=0.0,
+                )
+                if new_position.x != 0xFFFFFFFF and new_position.y != 0xFFFFFFFF:
+                    dotbot.lh2_position = new_position
+                    dotbot.position_history.append(new_position)
+                    if len(dotbot.position_history) > MAX_POSITION_HISTORY_SIZE:
+                        dotbot.position_history.pop(0)
+                need_update = True
+
+            if dotbot.battery != frame.packet.payload.battery / 1000.0:
+                dotbot.battery = frame.packet.payload.battery / 1000.0  # mV to V
+                need_update = True
+
+            self.logger.debug(
+                "Advertisement Data",
+                direction=frame.packet.payload.direction,
+                X=frame.packet.payload.pos_x,
+                Y=frame.packet.payload.pos_x,
+                battery=frame.packet.payload.battery,
+            )
+            if need_update is True:
+                notification_cmd = DotBotNotificationCommand.UPDATE
 
         if (
-            frame.packet.payload_type
-            in [PayloadType.DOTBOT_DATA, PayloadType.SAILBOT_DATA]
+            frame.packet.payload_type == PayloadType.SAILBOT_DATA
             and -500 <= frame.packet.payload.direction <= 500
         ):
             dotbot.direction = frame.packet.payload.direction
@@ -577,60 +598,6 @@ class Controller:
                 rudder_angle=dotbot.rudder_angle,
                 sail_angle=dotbot.sail_angle,
             )
-
-        if frame.packet.payload_type == PayloadType.DOTBOT_DATA:
-            new_position = DotBotLH2Position(
-                x=frame.packet.payload.pos_x / 1e6,
-                y=frame.packet.payload.pos_y / 1e6,
-                z=0.0,
-            )
-            dotbot.direction = frame.packet.payload.direction
-            dotbot.lh2_position = new_position
-            dotbot.position_history.append(new_position)
-            notification_cmd = DotBotNotificationCommand.UPDATE
-            if len(dotbot.position_history) > MAX_POSITION_HISTORY_SIZE:
-                dotbot.position_history.pop(0)
-            self.logger.info(
-                "Received DotBot Data",
-                direction=dotbot.direction,
-                X=new_position.x,
-                Y=new_position.y,
-            )
-
-        if frame.packet.payload_type == PayloadType.LH2_RAW_DATA:
-            self.lh2_manager.last_raw_data = frame.packet.payload
-            self.logger.debug(
-                "Received LH2 Raw Data",
-                location_1_bits=self.lh2_manager.last_raw_data.locations[0].bits,
-                location_1_index=self.lh2_manager.last_raw_data.locations[
-                    0
-                ].polynomial_index,
-                location_1_offset=self.lh2_manager.last_raw_data.locations[0].offset,
-                location_2_bits=self.lh2_manager.last_raw_data.locations[1].bits,
-                location_2_index=self.lh2_manager.last_raw_data.locations[
-                    1
-                ].polynomial_index,
-                location_2_offset=self.lh2_manager.last_raw_data.locations[1].offset,
-            )
-
-        if frame.packet.payload_type == PayloadType.LH2_PROCESSED_DATA:
-            logger.info(
-                "lh2-processed",
-                poly=frame.packet.payload.polynomial_index,
-                lfsr_index=frame.packet.payload.lfsr_index,
-                db_time=frame.packet.payload.timestamp_us,
-            )
-
-        if frame.packet.payload_type == PayloadType.DOTBOT_SIMULATOR_DATA:
-            dotbot.direction = frame.packet.payload.theta
-            new_position = DotBotLH2Position(
-                x=frame.packet.payload.pos_x / 1e6,
-                y=frame.packet.payload.pos_y / 1e6,
-                z=0,
-            )
-            dotbot.lh2_position = new_position
-            dotbot.position_history.append(new_position)
-            notification_cmd = DotBotNotificationCommand.UPDATE
 
         if frame.packet.payload_type in [
             PayloadType.GPS_POSITION,
@@ -674,6 +641,7 @@ class Controller:
                     sail_angle=dotbot.sail_angle,
                     lh2_position=dotbot.lh2_position,
                     gps_position=dotbot.gps_position,
+                    battery=dotbot.battery,
                 ),
             )
         else:
@@ -743,7 +711,10 @@ class Controller:
         """Starts the web server application."""
         logger = LOGGER.bind(context=__name__)
         config = uvicorn.Config(
-            api, port=self.settings.controller_http_port, log_level="critical"
+            api,
+            host="0.0.0.0",
+            port=self.settings.controller_http_port,
+            log_level="critical",
         )
         server = uvicorn.Server(config)
 
@@ -769,8 +740,17 @@ class Controller:
                 use_tls=self.settings.mqtt_use_tls,
                 network_id=int(self.settings.network_id, 16),
             )
+        elif self.settings.adapter == "dotbot-simulator":
+            self.adapter = DotBotSimulatorAdapter(
+                self.settings.simulator_init_state_path,
+            )
+        elif self.settings.adapter == "sailbot-simulator":
+            self.adapter = SailBotSimulatorAdapter()
         else:
-            self.adapter = SerialAdapter(self.settings.port, self.settings.baudrate)
+            self.adapter = SerialAdapter(
+                self.settings.port,
+                self.settings.baudrate,
+            )
         self.logger.info(
             "Starting communication adapter", adapter=self.settings.adapter
         )
@@ -804,6 +784,7 @@ class Controller:
         except SystemExit:
             pass
         finally:
+            self.adapter.close()
             self.logger.info("Stopping controller")
             for task in tasks:
                 self.logger.info(f"Cancelling task '{task.get_name()}'")

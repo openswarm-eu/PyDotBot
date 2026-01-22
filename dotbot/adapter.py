@@ -3,6 +3,15 @@
 import asyncio
 from abc import ABC, abstractmethod
 
+from dotbot_utils.hdlc import HDLCHandler, HDLCState, hdlc_encode
+from dotbot_utils.protocol import (
+    Frame,
+    Header,
+    Packet,
+    Payload,
+    ProtocolPayloadParserException,
+)
+from dotbot_utils.serial_interface import SerialInterface
 from marilib.communication_adapter import MQTTAdapter as MarilibMQTTAdapter
 from marilib.communication_adapter import SerialAdapter as MarilibSerialAdapter
 from marilib.mari_protocol import Frame as MariFrame
@@ -10,18 +19,10 @@ from marilib.marilib_cloud import MarilibCloud
 from marilib.marilib_edge import MarilibEdge
 from marilib.model import EdgeEvent, MariNode
 
-from dotbot.dotbot_simulator import DotBotSimulatorSerialInterface
-from dotbot.hdlc import HDLCHandler, HDLCState, hdlc_encode
+from dotbot import SIMULATOR_INIT_STATE_PATH_DEFAULT
+from dotbot.dotbot_simulator import DotBotSimulatorCommunicationInterface
 from dotbot.logger import LOGGER
-from dotbot.protocol import (
-    Frame,
-    Header,
-    Packet,
-    Payload,
-    ProtocolPayloadParserException,
-)
-from dotbot.sailbot_simulator import SailBotSimulatorSerialInterface
-from dotbot.serial_interface import SerialInterface
+from dotbot.sailbot_simulator import SailBotSimulatorCommunicationInterface
 
 
 class GatewayAdapterBase(ABC):
@@ -43,7 +44,11 @@ class GatewayAdapterBase(ABC):
 class SerialAdapter(GatewayAdapterBase):
     """Class used to interface with the serial port."""
 
-    def __init__(self, port: str, baudrate: int):
+    def __init__(
+        self,
+        port: str,
+        baudrate: int,
+    ):
         self.port = port
         self.baudrate = baudrate
         self.hdlc_handler = HDLCHandler()
@@ -56,7 +61,7 @@ class SerialAdapter(GatewayAdapterBase):
                 try:
                     frame = Frame.from_bytes(data)
                 except (ValueError, ProtocolPayloadParserException) as exc:
-                    LOGGER.error(f"Error parsing frame: {exc}")
+                    LOGGER.debug(f"Error parsing frame: {exc}")
                     return
             except Exception as _:
                 return
@@ -71,13 +76,8 @@ class SerialAdapter(GatewayAdapterBase):
             """Callback called on byte received."""
             event_loop.call_soon_threadsafe(queue.put_nowait, byte)
 
-        if self.port == "sailbot-simulator":
-            self.serial = SailBotSimulatorSerialInterface(_byte_received)
-        elif self.port == "dotbot-simulator":
-            self.serial = DotBotSimulatorSerialInterface(_byte_received)
-        else:
-            self.serial = SerialInterface(self.port, self.baudrate, _byte_received)
-            await asyncio.sleep(1)
+        self.serial = SerialInterface(self.port, self.baudrate, _byte_received)
+        await asyncio.sleep(1)
 
         LOGGER.info("Connected to gateway over serial")
         while 1:
@@ -94,7 +94,7 @@ class SerialAdapter(GatewayAdapterBase):
             packet=Packet.from_payload(payload),
         )
         self.serial.write(hdlc_encode(frame.to_bytes()))
-        self.serial.serial.flush()
+        self.serial.flush()
 
 
 class MarilibEdgeAdapter(GatewayAdapterBase):
@@ -111,14 +111,14 @@ class MarilibEdgeAdapter(GatewayAdapterBase):
 
         def _on_mari_event(event: EdgeEvent, event_data: MariNode | MariFrame):
             if event == EdgeEvent.NODE_JOINED:
-                LOGGER.debug("Node joined", event_data)
+                LOGGER.debug(f"Node joined: {event_data.address:016x}")
             elif event == EdgeEvent.NODE_LEFT:
-                LOGGER.debug("Node left", event_data)
+                LOGGER.debug(f"Node left: {event_data.address:016x}")
             elif event == EdgeEvent.NODE_DATA:
                 try:
                     packet = Packet.from_bytes(event_data.payload)
                 except (ValueError, ProtocolPayloadParserException) as exc:
-                    LOGGER.error(f"Error parsing packet: {exc}")
+                    LOGGER.debug(f"Error parsing packet: {exc}")
                     return
                 if not hasattr(self, "on_frame_received"):
                     return
@@ -168,14 +168,14 @@ class MarilibCloudAdapter(GatewayAdapterBase):
 
         def _on_mari_event(event: EdgeEvent, event_data: MariNode | MariFrame):
             if event == EdgeEvent.NODE_JOINED:
-                LOGGER.debug("Node joined:", event_data)
+                LOGGER.debug(f"Node joined: {event_data.address:016x}")
             elif event == EdgeEvent.NODE_LEFT:
-                LOGGER.debug("Node left:", event_data)
+                LOGGER.debug(f"Node left: {event_data.address:016x}")
             elif event == EdgeEvent.NODE_DATA:
                 try:
                     packet = Packet.from_bytes(event_data.payload)
                 except (ValueError, ProtocolPayloadParserException) as exc:
-                    LOGGER.error(f"Error parsing packet: {exc}")
+                    LOGGER.debug(f"Error parsing packet: {exc}")
                     return
                 if not hasattr(self, "on_frame_received"):
                     return
@@ -205,3 +205,60 @@ class MarilibCloudAdapter(GatewayAdapterBase):
             dst=destination,
             payload=Packet.from_payload(payload).to_bytes(),
         )
+
+
+class SimulatorAdapterBase(GatewayAdapterBase):
+    """Base class used to interface with the simulator."""
+
+    @abstractmethod
+    def create_simulator(self, _byte_received: callable):
+        """Create the simulator instance."""
+
+    async def start(self, on_frame_received: callable):
+        self.on_frame_received = on_frame_received
+        queue = asyncio.Queue()
+        event_loop = asyncio.get_event_loop()
+
+        def _frame_received(frame):
+            """Callback called on byte received."""
+            event_loop.call_soon_threadsafe(queue.put_nowait, frame)
+
+        self.simulator = self.create_simulator(_frame_received)
+
+        LOGGER.info("Connected to simulator")
+        while 1:
+            frame = await queue.get()
+            self.on_frame_received(frame)
+
+    def close(self):
+        LOGGER.info("Disconnect from simulator...")
+        self.simulator.stop()
+
+    def send_payload(self, destination: int, payload: Payload):
+        frame = Frame(
+            header=Header(destination=destination),
+            packet=Packet.from_payload(payload),
+        )
+        self.simulator.write(frame.to_bytes())
+
+
+class DotBotSimulatorAdapter(SimulatorAdapterBase):
+    """Class used to interface with the dotbot simulator."""
+
+    def __init__(
+        self,
+        simulator_init_state_path: str = SIMULATOR_INIT_STATE_PATH_DEFAULT,
+    ):
+        self.simulator_init_state_path = simulator_init_state_path
+
+    def create_simulator(self, on_frame_received: callable):
+        return DotBotSimulatorCommunicationInterface(
+            on_frame_received, self.simulator_init_state_path
+        )
+
+
+class SailBotSimulatorAdapter(SimulatorAdapterBase):
+    """Class used to interface with the sailbot simulator."""
+
+    def create_simulator(self, on_frame_received: callable):
+        return SailBotSimulatorCommunicationInterface(on_frame_received)

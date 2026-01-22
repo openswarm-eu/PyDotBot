@@ -2,7 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from dotbot.serial_interface import get_default_port
+from dotbot_utils.serial_interface import get_default_port
 
 SERIAL_PORT_DEFAULT = get_default_port()
 SERIAL_BAUDRATE_DEFAULT = 1000000
@@ -15,6 +15,7 @@ CONTROLLER_HTTP_PORT_DEFAULT = "8000"
 CONTROLLER_ADAPTER_DEFAULT = "serial"
 MQTT_HOST_DEFAULT = "localhost"
 MQTT_PORT_DEFAULT = 1883
+SIMULATOR_INIT_STATE_PATH_DEFAULT = "simulator_init_state.toml"
 
 
 def pydotbot_version() -> str:

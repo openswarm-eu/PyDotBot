@@ -62,6 +62,7 @@ Options:
   --log-level [debug|info|warning|error]
                                   Logging level. Defaults to info
   --log-output PATH               Filename where logs are redirected
+  --config-path FILE              Path to a .toml configuration file.
   --help                          Show this message and exit.
 ```
 
@@ -72,19 +73,25 @@ gateway and add `--port COM3` if it's COM3.
 
 Using the `--webbrowser` option, a tab will automatically open at
 [http://localhost:8000/PyDotBot](http://localhost:8000/PyDotBot). The page maintains
-a list of available DotBots, allows to set which one is active and controllable
+a list of available DotBots, allows to set which one is selected and controllable
 and provide a virtual joystick to control it or change the color of the on-board
 RGB LED.
 
-### Lighthouse positioning
+Use `--config-path` to specify the file:
 
-The DotBots firmware comes with a cheap indoor positioning system based on
-[Valve Lighthouse 2](https://www.valvesoftware.com/en/index/base-stations).
+```bash
+# Use settings from the config file
+dotbot-controller --config-path config_sample.toml
+# Use config file but override port and adapter (simulator example)
+dotbot-controller --config-path config_sample.toml -a dotbot-simulator
+```
 
-To get the positioning to work and the DotBots to be tracked in real-time the
-system must be first calibrated by clicking the "Start calibration" or
-"Update calibration" button below the grid map and then by following the
-instructions there.
+Values defined in the config file behave exactly like CLI options.
+If both are provided, CLI flags override config values.
+
+**Firefox users:**
+If the webapp is not working, press `Ctrl + L`, type `about:config`,
+and set `network.http.http2.websockets` to `false`.
 
 ## Tests
 
@@ -94,7 +101,6 @@ To run the tests, install [tox](https://pypi.org/project/tox/) and use it:
 tox
 ```
 
-
 [ci-badge]: https://github.com/DotBots/PyDotBot/workflows/CI/badge.svg
 [ci-link]: https://github.com/DotBots/PyDotBot/actions?query=workflow%3ACI+branch%3Amain
 [pypi-badge]: https://badge.fury.io/py/pydotbot.svg
@@ -103,10 +109,8 @@ tox
 [doc-link]: https://pydotbot.readthedocs.io/en/latest
 [license-badge]: https://img.shields.io/pypi/l/pydotbot
 [license-link]: https://github.com/DotBots/pydotbot/blob/main/LICENSE.txt
-
 [codecov-badge]: https://codecov.io/gh/DotBots/PyDotBot/branch/main/graph/badge.svg
 [codecov-link]: https://codecov.io/gh/DotBots/PyDotBot
-
 [pydotbot-overview]: https://github.com/DotBots/PyDotBot/blob/main/dotbots.png?raw=True
 [dotbot-firmware-repo]: https://github.com/DotBots/DotBot-firmware
 [dotbot-pcb-repo]: https://github.com/DotBots/DotBot-hardware

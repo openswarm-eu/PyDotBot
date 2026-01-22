@@ -22,7 +22,7 @@ from dotbot import (
 from dotbot.logger import LOGGER, setup_logging
 from dotbot.models import DotBotMoveRawCommandModel
 from dotbot.protocol import ApplicationType
-from dotbot.rest import RestClient
+from dotbot.rest import rest_client
 
 # Pygame support prompt is annoying, it can be hidden using an environment variable
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
@@ -43,11 +43,9 @@ APPLICATION_TYPE_MAP = {
 class JoystickController:
     """A Dotbot controller for a joystick interface."""
 
-    def __init__(
-        self, joystick_index, hostname, port, https, dotbot_address, application
-    ):
+    def __init__(self, joystick_index, client, dotbot_address, application):
         """Initialize the joystick controller."""
-        self.api = RestClient(hostname, port, https)
+        self.api = rest_client
         self.dotbots = []
         self.dotbot_address = dotbot_address
         self.application = APPLICATION_TYPE_MAP[application]
@@ -71,18 +69,18 @@ class JoystickController:
         self._logger.info("Controller initialized", num_axes=num_axes)
 
     @property
-    def active_dotbot(self):
-        _active_dotbot = self.dotbot_address
-        if _active_dotbot == DOTBOT_ADDRESS_DEFAULT:
+    def selected_dotbot(self):
+        _selected_dotbot = self.dotbot_address
+        if _selected_dotbot == DOTBOT_ADDRESS_DEFAULT:
             if self.dotbots and self.dotbots[0]["status"] == 0:
-                _active_dotbot = self.dotbots[0]["address"]
+                _selected_dotbot = self.dotbots[0]["address"]
             else:
                 self._logger.info("No active DotBot")
                 return
-        elif _active_dotbot not in [dotbot["address"] for dotbot in self.dotbots]:
+        elif _selected_dotbot not in [dotbot["address"] for dotbot in self.dotbots]:
             self._logger.info("Active DotBot not available")
             return
-        return _active_dotbot
+        return _selected_dotbot
 
     def pos_from_joystick(self):
         """Fetch positions of the joystick."""
@@ -113,7 +111,7 @@ class JoystickController:
             if positions != NULL_POSITION or self.previous_positions != NULL_POSITION:
                 self._logger.info("refresh positions", positions=positions)
                 await self.api.send_move_raw_command(
-                    self.active_dotbot,
+                    self.selected_dotbot,
                     self.application,
                     DotBotMoveRawCommandModel(
                         left_x=int(positions[0]),
@@ -177,20 +175,25 @@ class JoystickController:
 )
 def main(joystick, hostname, port, https, dotbot_address, application, log_level):
     """DotBot joystick controller."""
+    asyncio.run(
+        cli(joystick, hostname, port, https, dotbot_address, application, log_level)
+    )
+
+
+async def cli(joystick, hostname, port, https, dotbot_address, application, log_level):
     print(f"Welcome to the DotBots joystick interface (version: {pydotbot_version()}).")
     setup_logging(None, log_level, ["console"])
-    joystick_controller = JoystickController(
-        joystick,
-        hostname,
-        port,
-        https,
-        dotbot_address,
-        application,
-    )
-    try:
-        asyncio.run(joystick_controller.start())
-    except (SystemExit, KeyboardInterrupt):
-        sys.exit(0)
+    async with rest_client(hostname, port, https) as client:
+        joystick_controller = JoystickController(
+            joystick,
+            client,
+            dotbot_address,
+            application,
+        )
+        try:
+            await joystick_controller.start()
+        except (SystemExit, KeyboardInterrupt):
+            sys.exit(0)
 
 
 if __name__ == "__main__":

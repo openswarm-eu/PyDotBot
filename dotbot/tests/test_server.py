@@ -1,12 +1,12 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from dotbot.models import (
-    DotBotCalibrationStateModel,
     DotBotGPSPosition,
     DotBotLH2Position,
     DotBotModel,
@@ -15,9 +15,6 @@ from dotbot.models import (
 )
 from dotbot.protocol import (
     ApplicationType,
-    Frame,
-    Header,
-    Packet,
     PayloadCommandMoveRaw,
     PayloadCommandRgbLed,
     PayloadGPSPosition,
@@ -38,8 +35,6 @@ def controller():
     api.controller.header.destination = MagicMock()
     api.controller.dotbots = MagicMock()
     api.controller.get_dotbots = MagicMock()
-    api.controller.lh2_manager = MagicMock()
-    api.controller.lh2_manager.state_model = DotBotCalibrationStateModel(state="test")
     api.controller.notify_clients = AsyncMock()
     api.controller.send_payload = MagicMock()
     api.controller.settings = MagicMock()
@@ -89,19 +84,14 @@ async def test_set_dotbots_move_raw(dotbots, code, found):
     api.controller.dotbots = dotbots
     address = "4242"
     command = DotBotMoveRawCommandModel(left_x=42, left_y=0, right_x=42, right_y=0)
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     payload = PayloadCommandMoveRaw(**command.model_dump())
-    expected_frame = Frame(header=header, packet=Packet().from_payload(payload))
     response = await client.put(
         f"/controller/dotbots/{address}/0/move_raw",
         json=command.model_dump(),
     )
     assert response.status_code == code
     if found is True:
-        api.controller.send_payload.assert_called_with(expected_frame)
+        api.controller.send_payload.assert_called_with(int(address, 16), payload)
     else:
         api.controller.send_payload.assert_not_called()
 
@@ -142,12 +132,7 @@ async def test_set_dotbots_rgb_led(dotbots, code, found):
     api.controller.dotbots = dotbots
     address = "4242"
     command = DotBotRgbLedCommandModel(red=42, green=0, blue=42)
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     payload = PayloadCommandRgbLed(**command.model_dump())
-    expected_frame = Frame(header=header, packet=Packet().from_payload(payload))
     response = await client.put(
         f"/controller/dotbots/{address}/0/rgb_led",
         json=command.model_dump(),
@@ -155,7 +140,7 @@ async def test_set_dotbots_rgb_led(dotbots, code, found):
     assert response.status_code == code
 
     if found:
-        api.controller.send_payload.assert_called_with(expected_frame)
+        api.controller.send_payload.assert_called_with(int(address, 16), payload)
     else:
         api.controller.send_payload.assert_not_called()
 
@@ -269,10 +254,6 @@ async def test_set_dotbots_waypoints(
 ):
     api.controller.dotbots = dotbots
     address = "4242"
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     if application == ApplicationType.SailBot:
         payload = PayloadGPSWaypoints(
             threshold=10,
@@ -302,7 +283,6 @@ async def test_set_dotbots_waypoints(
         else:
             expected_waypoints = [DotBotLH2Position(x=0.5, y=0.1, z=0)]
 
-    expected_frame = Frame(header=header, packet=Packet().from_payload(payload))
     response = await client.put(
         f"/controller/dotbots/{address}/{application.value}/waypoints",
         json=message,
@@ -310,7 +290,7 @@ async def test_set_dotbots_waypoints(
     assert response.status_code == code
 
     if found:
-        api.controller.send_payload.assert_called_with(expected_frame)
+        api.controller.send_payload.assert_called_with(int(address, 16), payload)
         assert api.controller.dotbots[address].waypoints == expected_waypoints
         assert api.controller.dotbots[address].waypoints_threshold == expected_threshold
     else:
@@ -555,31 +535,6 @@ async def test_clear_dotbot_position_history(dotbots, address, code, found):
 
 
 @pytest.mark.asyncio
-async def test_lh2_calibration():
-    response = await client.get("/controller/lh2/calibration")
-    assert response.json() == DotBotCalibrationStateModel(state="test").model_dump()
-    assert response.status_code == 200
-
-    with patch(
-        "dotbot.server.api.controller.lh2_manager.add_calibration_point"
-    ) as point:
-        response = await client.post(
-            "/controller/lh2/calibration/2",
-        )
-        assert response.status_code == 200
-        point.assert_called_with(2)
-
-    with patch(
-        "dotbot.server.api.controller.lh2_manager.compute_calibration"
-    ) as calibration:
-        response = await client.put(
-            "/controller/lh2/calibration",
-        )
-        assert response.status_code == 200
-        calibration.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_ws_client():
     with TestClient(api).websocket_connect("/controller/ws/status") as websocket:
         await asyncio.sleep(0.1)
@@ -587,6 +542,62 @@ async def test_ws_client():
         websocket.close()
         await asyncio.sleep(0.1)
         assert len(api.controller.websockets) == 0
+
+
+@pytest.mark.asyncio
+async def test_reverse_proxy_middleware_redirects_to_upstream(monkeypatch):
+
+    async def mock_send(request: httpx.Request):
+        assert request.url == httpx.URL("http://localhost:8080/pin/test")
+
+        return httpx.Response(
+            status_code=200,
+            content=b"proxied-content",
+            headers={"X-Upstream": "mock"},
+        )
+
+    transport = httpx.MockTransport(mock_send)
+    RealAsyncClient = httpx.AsyncClient
+
+    def mock_async_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return RealAsyncClient(transport=transport, **kwargs)
+
+    import dotbot.server as server_module
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", mock_async_client)
+
+    client = TestClient(api)
+    response = client.get("/pin/test")
+
+    assert response.status_code == 200
+    assert response.content == b"proxied-content"
+    assert response.headers["X-Upstream"] == "mock"
+
+
+@pytest.mark.asyncio
+async def test_reverse_proxy_middleware_connect_error(monkeypatch):
+
+    async def mock_send_failed(*args, **kwargs):
+        raise httpx.ConnectError("connection failed")
+
+    transport = httpx.MockTransport(mock_send_failed)
+    RealAsyncClient = httpx.AsyncClient
+
+    def mock_async_client(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return RealAsyncClient(transport=transport, **kwargs)
+
+    import dotbot.server as server_module
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", mock_async_client)
+
+    client = TestClient(api)
+    response = client.get("/pin/fail")
+
+    assert response.status_code == 502
+    assert b"Proxy connection failed" in response.content
 
 
 # @pytest.mark.asyncio

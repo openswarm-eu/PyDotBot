@@ -5,19 +5,20 @@ import time
 from unittest.mock import patch
 
 import pytest
+from dotbot_utils.hdlc import hdlc_encode
+from dotbot_utils.protocol import Frame, Header, Packet
+from dotbot_utils.serial_interface import SerialInterface
 
 from dotbot.adapter import SerialAdapter
 from dotbot.controller import Controller, ControllerSettings, gps_distance, lh2_distance
-from dotbot.hdlc import hdlc_encode
 from dotbot.models import DotBotGPSPosition, DotBotLH2Position, DotBotModel
-from dotbot.protocol import ControlModeType, Frame, Header, Packet, PayloadControlMode
-from dotbot.serial_interface import SerialInterface
+from dotbot.protocol import ControlModeType, PayloadControlMode
 
 
 @pytest.mark.asyncio
-@patch("dotbot.serial_interface.serial.Serial.write")
-@patch("dotbot.serial_interface.serial.Serial.open")
-@patch("dotbot.serial_interface.serial.Serial.flush")
+@patch("dotbot_utils.serial_interface.serial.Serial.write")
+@patch("dotbot_utils.serial_interface.serial.Serial.open")
+@patch("dotbot_utils.serial_interface.serial.Serial.flush")
 async def test_controller(_, __, serial_write, capsys):
     """Check controller subclass instanciation and write to serial."""
     settings = ControllerSettings(
@@ -53,9 +54,9 @@ async def test_controller(_, __, serial_write, capsys):
 
 
 @pytest.mark.asyncio
-@patch("dotbot.serial_interface.serial.Serial.write")
-@patch("dotbot.serial_interface.serial.Serial.open")
-@patch("dotbot.serial_interface.serial.Serial.flush")
+@patch("dotbot_utils.serial_interface.serial.Serial.write")
+@patch("dotbot_utils.serial_interface.serial.Serial.open")
+@patch("dotbot_utils.serial_interface.serial.Serial.flush")
 async def test_controller_dont_send(_, __, serial_write):
     """Check controller subclass instanciation and write to serial."""
     settings = ControllerSettings(
@@ -77,13 +78,13 @@ async def test_controller_dont_send(_, __, serial_write):
     assert serial_write.call_count == 0
 
 
-def test_controller_saibot_simulator():
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_controller_sailbot_simulator():
     """Check controller called for sailbot simulator."""
 
     async def start_simulator():
         settings = ControllerSettings(
-            port="sailbot-simulator",
-            baudrate=115200,
+            adapter="sailbot-simulator",
             network_id="0",
             dotbot_address="456",
             gw_address="78",
@@ -99,15 +100,14 @@ def test_controller_saibot_simulator():
     loop.run_until_complete(start_simulator())
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 @patch("dotbot.controller.QrkeyController.start")
 def test_controller_dotbot_simulator(_):
     """Check controller called for dotbot simulator."""
 
     async def start_simulator():
         settings = ControllerSettings(
-            adapter="serial",
-            port="dotbot-simulator",
-            baudrate=115200,
+            adapter="dotbot-simulator",
             network_id="0",
             dotbot_address="456",
             gw_address="78",
@@ -141,12 +141,12 @@ def test_lh2_distance(last, new, result):
         (
             DotBotGPSPosition(latitude=45.7597, longitude=4.8422),  # Lyon
             DotBotGPSPosition(latitude=48.8567, longitude=2.3508),  # Paris
-            392217.25594,
+            392216.71780,
         ),
         (
             DotBotGPSPosition(latitude=51.509865, longitude=-0.118092),  # London
             DotBotGPSPosition(latitude=48.8567, longitude=2.3508),  # Paris
-            343374.55271,
+            343374.07842,
         ),
     ],
 )

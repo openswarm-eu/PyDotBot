@@ -8,13 +8,16 @@
 import os
 from typing import List
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from dotbot import pydotbot_version
+from dotbot.logger import LOGGER
 from dotbot.models import (
-    DotBotCalibrationStateModel,
     DotBotModel,
     DotBotMoveRawCommandModel,
     DotBotNotificationCommand,
@@ -25,9 +28,6 @@ from dotbot.models import (
 )
 from dotbot.protocol import (
     ApplicationType,
-    Frame,
-    Header,
-    Packet,
     PayloadCommandMoveRaw,
     PayloadCommandRgbLed,
     PayloadGPSPosition,
@@ -39,6 +39,33 @@ from dotbot.protocol import (
 PYDOTBOT_FRONTEND_BASE_URL = os.getenv(
     "PYDOTBOT_FRONTEND_BASE_URL", "https://dotbots.github.io/PyDotBot"
 )
+
+
+class ReverseProxyMiddleware(BaseHTTPMiddleware):
+
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/pin"):
+            headers = {k: v for k, v in request.headers.items()}
+            url = f"http://localhost:8080{request.url.path}"
+
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(
+                        url,
+                        headers=headers,
+                    )
+                except httpx.ConnectError as exc:
+                    LOGGER.warning(exc)
+                    return Response(status_code=502, content=b"Proxy connection failed")
+
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response.headers,
+                )
+
+        response = await call_next(request)
+        return response
 
 
 api = FastAPI(
@@ -56,6 +83,7 @@ api.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+api.add_middleware(ReverseProxyMiddleware)
 
 
 @api.put(
@@ -70,18 +98,13 @@ async def dotbots_move_raw(
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
 
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     payload = PayloadCommandMoveRaw(
         left_x=command.left_x,
         left_y=command.left_y,
         right_x=command.right_x,
         right_y=command.right_y,
     )
-    frame = Frame(header=header, packet=Packet().from_payload(payload))
-    api.controller.send_payload(frame)
+    api.controller.send_payload(int(address, 16), payload)
     api.controller.dotbots[address].move_raw = command
 
 
@@ -97,15 +120,10 @@ async def dotbots_rgb_led(
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
 
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     payload = PayloadCommandRgbLed(
         red=command.red, green=command.green, blue=command.blue
     )
-    frame = Frame(header=header, packet=Packet().from_payload(payload))
-    api.controller.send_payload(frame)
+    api.controller.send_payload(int(address, 16), payload)
     api.controller.dotbots[address].rgb_led = command
 
 
@@ -123,10 +141,6 @@ async def dotbots_waypoints(
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
 
-    header = Header(
-        destination=int(address, 16),
-        source=int(api.controller.settings.gw_address, 16),
-    )
     waypoints_list = waypoints.waypoints
     if application == ApplicationType.SailBot.value:
         if api.controller.dotbots[address].gps_position is not None:
@@ -163,8 +177,7 @@ async def dotbots_waypoints(
         )
     api.controller.dotbots[address].waypoints = waypoints_list
     api.controller.dotbots[address].waypoints_threshold = waypoints.threshold
-    frame = Frame(header, packet=Packet().from_payload(payload))
-    api.controller.send_payload(frame)
+    api.controller.send_payload(int(address, 16), payload)
     await api.controller.notify_clients(
         DotBotNotificationModel(cmd=DotBotNotificationCommand.RELOAD)
     )
@@ -208,38 +221,6 @@ async def dotbot(address: str, query: DotBotQueryModel = Depends()):
 async def dotbots(query: DotBotQueryModel = Depends()):
     """Dotbots HTTP GET handler."""
     return api.controller.get_dotbots(query)
-
-
-@api.post(
-    path="/controller/lh2/calibration/{point_idx}",
-    summary="Trigger the acquisition of one LH2 point",
-    tags=["dotbots"],
-)
-async def controller_add_lh2_calibration_point(point_idx: int):
-    """LH2 calibration, add single calibration point."""
-    api.controller.lh2_manager.add_calibration_point(point_idx)
-
-
-@api.put(
-    path="/controller/lh2/calibration",
-    summary="Trigger a computation of the LH2 calibration",
-    tags=["dotbots"],
-)
-async def controller_apply_lh2_calibration():
-    """Apply LH2 calibration."""
-    api.controller.lh2_manager.compute_calibration()
-
-
-@api.get(
-    path="/controller/lh2/calibration",
-    response_model=DotBotCalibrationStateModel,
-    response_model_exclude_none=True,
-    summary="Return the LH2 calibration state",
-    tags=["dotbots"],
-)
-async def controller_get_lh2_calibration():
-    """LH2 calibration GET handler."""
-    return api.controller.lh2_manager.state_model
 
 
 @api.websocket("/controller/ws/status")

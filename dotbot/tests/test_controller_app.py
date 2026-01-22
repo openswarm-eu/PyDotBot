@@ -15,7 +15,7 @@ MAIN_HELP_EXPECTED = """Usage: main [OPTIONS]
   DotBotController, universal SailBot and DotBot controller.
 
 Options:
-  -a, --adapter [serial|edge|cloud]
+  -a, --adapter [serial|edge|cloud|dotbot-simulator|sailbot-simulator]
                                   Controller interface adapter. Defaults to
                                   serial
   -p, --port TEXT                 Serial port used by 'serial' and 'edge'
@@ -41,6 +41,7 @@ Options:
   --log-level [debug|info|warning|error]
                                   Logging level. Defaults to info
   --log-output PATH               Filename where logs are redirected
+  --config-path FILE              Path to a .toml configuration file.
   --help                          Show this message and exit.
 """
 
@@ -53,7 +54,7 @@ def test_main_help():
     assert result.output == MAIN_HELP_EXPECTED
 
 
-@patch("dotbot.serial_interface.serial.Serial.open")
+@patch("dotbot_utils.serial_interface.serial.Serial.open")
 @patch("dotbot.controller.QrkeyController")
 @patch("dotbot.version")
 @patch("dotbot.controller.Controller.run")
@@ -71,7 +72,7 @@ def test_main(run, version, _, __):
     assert "Welcome to the DotBots controller (version: unknown)." in result.output
 
 
-@patch("dotbot.serial_interface.serial.Serial.open")
+@patch("dotbot_utils.serial_interface.serial.Serial.open")
 @patch("dotbot.controller.QrkeyController")
 @patch("dotbot.controller.Controller.run")
 def test_main_interrupts(run, _, __):
@@ -89,3 +90,27 @@ def test_main_interrupts(run, _, __):
     result = runner.invoke(main)
     assert result.exit_code != 0
     assert "Serial error: serial test error" in result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Doesn't work on Windows")
+@patch("dotbot_utils.serial_interface.serial.Serial.open")
+@patch("dotbot.controller.QrkeyController")
+@patch("dotbot.controller_app.Controller")
+def test_main_with_config(controller, _, __, tmp_path):
+    log_file = tmp_path / "logfile.log"
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        f"""
+adapter = "serial"
+network_id = "AA26"
+log_level = "debug"
+log_output = "{log_file}"
+"""
+    )
+
+    runner = CliRunner()
+    runner.invoke(main, ["--config-path", config_file.as_posix()])
+    assert controller.call_args.args[0].network_id == "AA26"
+    assert controller.call_args.args[0].adapter == "serial"
+    assert controller.call_args.args[0].log_level == "debug"
+    assert controller.call_args.args[0].log_output == str(log_file)

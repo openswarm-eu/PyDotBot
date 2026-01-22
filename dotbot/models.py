@@ -25,18 +25,6 @@ class DotBotAddressModel(BaseModel):
     address: str
 
 
-class DotBotCalibrationStateModel(BaseModel):
-    """Model that holds the controller LH2 calibration state."""
-
-    state: str
-
-
-class DotBotCalibrationIndexModel(BaseModel):
-    """Model that holds the controller LH2 calibration index."""
-
-    index: int
-
-
 class MqttPinCodeModel(BaseModel):
     """Pin code used to derive crypto keys for MQTT."""
 
@@ -97,9 +85,9 @@ class DotBotWaypoints(BaseModel):
 class DotBotStatus(IntEnum):
     """Status of a DotBot."""
 
-    ALIVE: int = 0
-    LOST: int = 1
-    DEAD: int = 2
+    ACTIVE: int = 0
+    INACTIVE: int = 1
+    LOST: int = 2
 
 
 class DotBotQueryModel(BaseModel):
@@ -131,6 +119,7 @@ class DotBotNotificationUpdate(BaseModel):
     sail_angle: Optional[int]
     lh2_position: Optional[DotBotLH2Position] = None
     gps_position: Optional[DotBotGPSPosition] = None
+    battery: Optional[float] = None
 
 
 class DotBotNotificationModel(BaseModel):
@@ -145,7 +134,6 @@ class DotBotRequestType(IntEnum):
     """Request received from MQTT client."""
 
     DOTBOTS: int = 0
-    LH2_CALIBRATION_STATE: int = 1
 
 
 class DotBotRequestModel(BaseModel):
@@ -168,7 +156,7 @@ class DotBotModel(BaseModel):
     address: str
     application: ApplicationType = ApplicationType.DotBot
     swarm: str = "0000"
-    status: DotBotStatus = DotBotStatus.ALIVE
+    status: DotBotStatus = DotBotStatus.ACTIVE
     mode: ControlModeType = ControlModeType.MANUAL
     last_seen: float
     direction: Optional[int] = None
@@ -183,3 +171,4 @@ class DotBotModel(BaseModel):
     waypoints_threshold: int = 40
     position_history: List[Union[DotBotLH2Position, DotBotGPSPosition]] = []
     calibrated: bool = False
+    battery: float = 0.0  # Voltage in Volts
