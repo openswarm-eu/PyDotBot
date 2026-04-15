@@ -8,6 +8,7 @@
 """Interface of the Dotbot controller."""
 
 import asyncio
+import dataclasses
 import json
 import math
 import os
@@ -19,20 +20,18 @@ from pathlib import Path
 from typing import Dict, List
 
 import serial
+import starlette
 import uvicorn
 import websockets
 from dotbot_utils.protocol import Frame, Payload
 from dotbot_utils.serial_interface import SerialInterfaceException
 from fastapi import WebSocket
-from pydantic import ValidationError
-from pydantic.tools import parse_obj_as
-from qrkey import QrkeyController, SubscriptionModel, qrkey_settings
 
 from dotbot import (
     CONTROLLER_ADAPTER_DEFAULT,
     CONTROLLER_HTTP_PORT_DEFAULT,
-    DOTBOT_ADDRESS_DEFAULT,
     GATEWAY_ADDRESS_DEFAULT,
+    MAP_SIZE_DEFAULT,
     MQTT_HOST_DEFAULT,
     MQTT_PORT_DEFAULT,
     NETWORK_ID_DEFAULT,
@@ -53,30 +52,18 @@ from dotbot.models import (
     MAX_POSITION_HISTORY_SIZE,
     DotBotGPSPosition,
     DotBotLH2Position,
+    DotBotMapSizeModel,
     DotBotModel,
-    DotBotMoveRawCommandModel,
     DotBotNotificationCommand,
     DotBotNotificationModel,
     DotBotNotificationUpdate,
     DotBotQueryModel,
-    DotBotReplyModel,
-    DotBotRequestModel,
-    DotBotRequestType,
-    DotBotRgbLedCommandModel,
     DotBotStatus,
-    DotBotWaypoints,
-    DotBotXGOActionCommandModel,
 )
 from dotbot.protocol import (
     ApplicationType,
-    PayloadCommandMoveRaw,
-    PayloadCommandRgbLed,
-    PayloadCommandXgoAction,
-    PayloadGPSPosition,
-    PayloadGPSWaypoints,
+    ControlModeType,
     PayloadLh2CalibrationHomography,
-    PayloadLH2Location,
-    PayloadLH2Waypoints,
     PayloadType,
 )
 from dotbot.server import api
@@ -89,23 +76,33 @@ from dotbot.server import api
 # )
 
 
-CONTROLLERS = {}
 INACTIVE_DELAY = 5  # seconds
 LOST_DELAY = 60  # seconds
-LH2_POSITION_DISTANCE_THRESHOLD = 0.01
+LH2_POSITION_DISTANCE_THRESHOLD = 20  # mm
 GPS_POSITION_DISTANCE_THRESHOLD = 5  # meters
 CALIBRATION_PATH = Path.home() / ".dotbot" / "calibration.out"
 
 
-def load_calibration() -> PayloadLh2CalibrationHomography:
+@dataclass
+class CalibrationHomography:
+    """Dataclass that holds computed LH2 homography for a basestation indicated by index."""
+
+    homography_matrix: bytes = dataclasses.field(default_factory=lambda: bytearray)
+
+
+def load_calibration() -> list[CalibrationHomography]:
     if not os.path.exists(CALIBRATION_PATH):
-        return None
+        return []
     with open(CALIBRATION_PATH, "rb") as calibration_file:
-        index = int.from_bytes(calibration_file.read(4), "little", signed=False)
-        homography_matrix = calibration_file.read(36)
-    return PayloadLh2CalibrationHomography(
-        index=index, homography_matrix=homography_matrix
-    )
+        homographies: list[CalibrationHomography] = []
+        homographies_num = int.from_bytes(
+            calibration_file.read(1), "little", signed=False
+        )
+        for _ in range(homographies_num):
+            homographies.append(
+                CalibrationHomography(homography_matrix=calibration_file.read(36))
+            )
+    return homographies
 
 
 class ControllerException(Exception):
@@ -122,10 +119,11 @@ class ControllerSettings:
     mqtt_host: str = MQTT_HOST_DEFAULT
     mqtt_port: int = MQTT_PORT_DEFAULT
     mqtt_use_tls: bool = False
-    dotbot_address: str = DOTBOT_ADDRESS_DEFAULT
     gw_address: str = GATEWAY_ADDRESS_DEFAULT
     network_id: str = NETWORK_ID_DEFAULT
     controller_http_port: int = CONTROLLER_HTTP_PORT_DEFAULT
+    map_size: str = MAP_SIZE_DEFAULT
+    background_map: str = ""
     webbrowser: bool = False
     verbose: bool = False
     log_level: str = "info"
@@ -193,238 +191,13 @@ class Controller:
         self.settings = settings
         self.adapter: GatewayAdapterBase = None
         self.websockets = []
-        self.lh2_calibration = load_calibration()
+        self.lh2_calibration: list[CalibrationHomography] = load_calibration()
         self.api = api
+        self.map_size = DotBotMapSizeModel(
+            width=int(settings.map_size.split("x")[0]),
+            height=int(settings.map_size.split("x")[1]),
+        )
         api.controller = self
-        self.qrkey = None
-
-        self.subscriptions = [
-            SubscriptionModel(
-                topic="/command/+/+/+/move_raw", callback=self.on_command_move_raw
-            ),
-            SubscriptionModel(
-                topic="/command/+/+/+/rgb_led", callback=self.on_command_rgb_led
-            ),
-            SubscriptionModel(
-                topic="/command/+/+/+/xgo_action", callback=self.on_command_xgo_action
-            ),
-            SubscriptionModel(
-                topic="/command/+/+/+/waypoints", callback=self.on_command_waypoints
-            ),
-            SubscriptionModel(
-                topic="/command/+/+/+/clear_position_history",
-                callback=self.on_command_clear_position_history,
-            ),
-        ]
-
-    def on_command_move_raw(self, topic, payload):
-        """Called when a move raw command is received."""
-        logger = self.logger.bind(command="move_raw", topic=topic)
-        topic_split = topic.split("/")[2:]
-        if len(topic_split) != 4 or topic_split[-1] != "move_raw":
-            logger.warning("Invalid move_raw command topic")
-            return
-        _, address, application, _ = topic_split
-        try:
-            command = DotBotMoveRawCommandModel(**payload)
-        except ValidationError as exc:
-            self.logger.warning(f"Invalid move raw command: {exc.errors()}")
-            return
-        logger.bind(
-            address=address,
-            application=ApplicationType(int(application)).name,
-            **command.model_dump(),
-        )
-        if address not in self.dotbots:
-            logger.warning("DotBot not found")
-            return
-        payload = PayloadCommandMoveRaw(
-            left_x=command.left_x,
-            left_y=command.left_y,
-            right_x=command.right_x,
-            right_y=command.right_y,
-        )
-        logger.info(
-            "Sending MQTT command", address=address, command=payload.__class__.__name__
-        )
-        self.send_payload(int(address, 16), payload=payload)
-        self.dotbots[address].move_raw = command
-
-    def on_command_rgb_led(self, topic, payload):
-        """Called when an rgb led command is received."""
-        logger = self.logger.bind(command="rgb_led", topic=topic)
-        topic_split = topic.split("/")[2:]
-        if len(topic_split) != 4 or topic_split[-1] != "rgb_led":
-            logger.warning("Invalid rgb_led command topic")
-            return
-        _, address, application, _ = topic_split
-        try:
-            command = DotBotRgbLedCommandModel(**payload)
-        except ValidationError as exc:
-            LOGGER.warning(f"Invalid rgb led command: {exc.errors()}")
-            return
-        logger = logger.bind(
-            address=address,
-            application=ApplicationType(int(application)).name,
-            **command.model_dump(),
-        )
-        if address not in self.dotbots:
-            logger.warning("DotBot not found")
-            return
-        payload = PayloadCommandRgbLed(
-            red=command.red, green=command.green, blue=command.blue
-        )
-        logger.info(
-            "Sending MQTT command", address=address, command=payload.__class__.__name__
-        )
-        self.send_payload(int(address, 16), payload=payload)
-        self.dotbots[address].rgb_led = command
-        self.qrkey.publish(
-            "/notify",
-            DotBotNotificationModel(cmd=DotBotNotificationCommand.RELOAD).model_dump(
-                exclude_none=True
-            ),
-        )
-
-    def on_command_xgo_action(self, topic, payload):
-        """Called when an rgb led command is received."""
-        logger = self.logger.bind(command="xgo_action", topic=topic)
-        topic_split = topic.split("/")[2:]
-        if len(topic_split) != 4 or topic_split[-1] != "xgo_action":
-            logger.warning("Invalid xgo_action command topic")
-            return
-        _, address, application, _ = topic_split
-        try:
-            command = DotBotXGOActionCommandModel(**payload)
-        except ValidationError as exc:
-            LOGGER.warning(f"Invalid rgb led command: {exc.errors()}")
-            return
-        logger = logger.bind(
-            address=address,
-            application=ApplicationType(int(application)).name,
-            **command.model_dump(),
-        )
-        if address not in self.dotbots:
-            logger.warning("DotBot not found")
-            return
-        payload = PayloadCommandXgoAction(action=command.action)
-        logger.info(
-            "Sending MQTT command", address=address, command=payload.__class__.__name__
-        )
-        self.send_payload(int(address, 16), payload=payload)
-
-    def on_command_waypoints(self, topic, payload):
-        """Called when a list of waypoints is received."""
-        logger = self.logger.bind(command="waypoints", topic=topic)
-        topic_split = topic.split("/")[2:]
-        if len(topic_split) != 4 or topic_split[-1] != "waypoints":
-            logger.warning("Invalid waypoints command topic")
-            return
-        _, address, application, _ = topic_split
-        command = parse_obj_as(DotBotWaypoints, payload)
-        logger = logger.bind(
-            address=address,
-            application=ApplicationType(int(application)).name,
-            threshold=command.threshold,
-            length=len(command.waypoints),
-        )
-        if address not in self.dotbots:
-            logger.warning("DotBot not found")
-            return
-        waypoints_list = command.waypoints
-        if ApplicationType(int(application)) == ApplicationType.SailBot:
-            if self.dotbots[address].gps_position is not None:
-                waypoints_list = [
-                    self.dotbots[address].gps_position
-                ] + command.waypoints
-            payload = PayloadGPSWaypoints(
-                threshold=command.threshold,
-                count=len(command.waypoints),
-                waypoints=[
-                    PayloadGPSPosition(
-                        latitude=int(waypoint.latitude * 1e6),
-                        longitude=int(waypoint.longitude * 1e6),
-                    )
-                    for waypoint in command.waypoints
-                ],
-            )
-        else:  # DotBot application
-            if self.dotbots[address].lh2_position is not None:
-                waypoints_list = [
-                    self.dotbots[address].lh2_position
-                ] + command.waypoints
-            payload = PayloadLH2Waypoints(
-                threshold=command.threshold,
-                count=len(command.waypoints),
-                waypoints=[
-                    PayloadLH2Location(
-                        pos_x=int(waypoint.x * 1e6),
-                        pos_y=int(waypoint.y * 1e6),
-                        pos_z=int(waypoint.z * 1e6),
-                    )
-                    for waypoint in command.waypoints
-                ],
-            )
-        logger.info(
-            "Sending MQTT command", address=address, command=payload.__class__.__name__
-        )
-        self.send_payload(int(address, 16), payload=payload)
-        self.dotbots[address].waypoints = waypoints_list
-        self.dotbots[address].waypoints_threshold = command.threshold
-        self.qrkey.publish(
-            "/notify",
-            DotBotNotificationModel(cmd=DotBotNotificationCommand.RELOAD).model_dump(
-                exclude_none=True
-            ),
-        )
-
-    def on_command_clear_position_history(self, topic, _):
-        """Called when a clear position history command is received."""
-        logger = self.logger.bind(command="clear_position_history", topic=topic)
-        topic_split = topic.split("/")[2:]
-        if len(topic_split) != 4 or topic_split[-1] != "clear_position_history":
-            logger.warning("Invalid clear_position_history command topic")
-            return
-        _, address, application, _ = topic_split
-        logger = logger.bind(
-            address=address,
-            application=ApplicationType(int(application)).name,
-        )
-        if address not in self.dotbots:
-            logger.warning("DotBot not found")
-            return
-        logger.info("Notify clear command", address=address)
-        self.dotbots[address].position_history = []
-        self.qrkey.publish(
-            "/notify",
-            DotBotNotificationModel(cmd=DotBotNotificationCommand.RELOAD).model_dump(
-                exclude_none=True
-            ),
-        )
-
-    def on_request(self, payload):
-        logger = LOGGER.bind(topic="/request")
-        logger.info("Request received", **payload)
-        try:
-            request = DotBotRequestModel(**payload)
-        except ValidationError as exc:
-            logger.warning(f"Invalid request: {exc.errors()}")
-            return
-
-        reply_topic = f"/reply/{request.reply}"
-        if request.request == DotBotRequestType.DOTBOTS:
-            logger.info("Publish dotbots")
-            data = [
-                dotbot.model_dump(exclude_none=True)
-                for dotbot in self.get_dotbots(DotBotQueryModel())
-            ]
-            message = DotBotReplyModel(
-                request=DotBotRequestType.DOTBOTS,
-                data=data,
-            ).model_dump(exclude_none=True)
-            self.qrkey.publish(reply_topic, message)
-        else:
-            logger.warning("Unsupported request command")
 
     async def _open_webbrowser(self):
         """Wait until the server is ready before opening a web browser."""
@@ -438,18 +211,7 @@ class Controller:
             else:
                 writer.close()
                 break
-        url = (
-            f"http://localhost:{self.settings.controller_http_port}/PyDotBot?"
-            f"pin={self.qrkey.pin_code}&"
-            f"mqtt_host={qrkey_settings.mqtt_host}&"
-            f"mqtt_port={qrkey_settings.mqtt_ws_port}&"
-            f"mqtt_version={qrkey_settings.mqtt_version}&"
-            f"mqtt_use_ssl={qrkey_settings.mqtt_use_ssl}"
-        )
-        if qrkey_settings.mqtt_username is not None:
-            url += f"&mqtt_username={qrkey_settings.mqtt_username}"
-        if qrkey_settings.mqtt_password is not None:
-            url += f"&mqtt_password={qrkey_settings.mqtt_password}"
+        url = f"http://localhost:{self.settings.controller_http_port}/PyDotBot"
         self.logger.debug("Using frontend URL", url=url)
         if self.settings.webbrowser is True:
             self.logger.info("Opening webbrowser", url=url)
@@ -535,7 +297,7 @@ class Controller:
         else:
             # reload if a new dotbot comes in
             logger.info("New robot")
-            notification_cmd = DotBotNotificationCommand.RELOAD
+            notification_cmd = DotBotNotificationCommand.NEW_DOTBOT
 
         if frame.packet.payload_type == PayloadType.ADVERTISEMENT:
             logger = logger.bind(
@@ -547,32 +309,70 @@ class Controller:
 
         if frame.packet.payload_type == PayloadType.DOTBOT_ADVERTISEMENT:
             logger = logger.bind(application=ApplicationType.DotBot.name)
-            dotbot.calibrated = bool(frame.packet.payload.calibrated)
-            logger.info("Advertisement received", calibrated=bool(dotbot.calibrated))
+            dotbot.calibrated = int(frame.packet.payload.calibrated)
+            dict_adv = dataclasses.asdict(frame.packet.payload)
+            dict_adv.pop("metadata", None)
+            logger.info(
+                "Advertisement received", cal_hex=hex(dotbot.calibrated), **dict_adv
+            )
             # Send calibration to dotbot if it's not calibrated and the localization system has calibration
             need_update = False
-            if dotbot.calibrated is False and self.lh2_calibration is not None:
+            is_fully_calibrated = all(
+                [
+                    dotbot.calibrated >> index & 0x01
+                    for index in range(len(self.lh2_calibration))
+                ]
+            )
+            if is_fully_calibrated is False and self.lh2_calibration:
                 # Send calibration to new dotbot if the localization system is calibrated
                 self.logger.info("Send calibration data", payload=self.lh2_calibration)
                 self.dotbots.update({dotbot.address: dotbot})
-                self.send_payload(int(source, 16), payload=self.lh2_calibration)
-            elif dotbot.calibrated is True:
+                for index, homography in enumerate(self.lh2_calibration):
+                    self.logger.info(
+                        "Sending calibration homography",
+                        index=index,
+                        matrix=homography.homography_matrix,
+                    )
+                    payload = PayloadLh2CalibrationHomography(
+                        index=index,
+                        homography_matrix=homography.homography_matrix,
+                    )
+                    self.send_payload(int(source, 16), payload=payload)
+            elif is_fully_calibrated is True:
                 if frame.packet.payload.direction != 0xFFFF:
                     dotbot.direction = frame.packet.payload.direction
                 new_position = DotBotLH2Position(
-                    x=frame.packet.payload.pos_x / 1e6,
-                    y=frame.packet.payload.pos_y / 1e6,
-                    z=0.0,
+                    x=frame.packet.payload.pos_x,
+                    y=frame.packet.payload.pos_y,
                 )
                 if new_position.x != 0xFFFFFFFF and new_position.y != 0xFFFFFFFF:
                     dotbot.lh2_position = new_position
-                    dotbot.position_history.append(new_position)
-                    if len(dotbot.position_history) > MAX_POSITION_HISTORY_SIZE:
-                        dotbot.position_history.pop(0)
+                    if (
+                        dotbot.position_history
+                        and lh2_distance(dotbot.position_history[-1], new_position)
+                        < LH2_POSITION_DISTANCE_THRESHOLD
+                    ):
+                        # If the new position is too close from the last one, we consider it as noise and we don't add it to the position history
+                        logger.debug(
+                            "Discarding LH2 position update because it's too close from the last one",
+                            last_position=dotbot.position_history[-1].model_dump(),
+                            new_position=new_position.model_dump(),
+                            distance=lh2_distance(
+                                dotbot.position_history[-1], new_position
+                            ),
+                        )
+                    else:
+                        dotbot.position_history.append(new_position)
+                        if len(dotbot.position_history) > MAX_POSITION_HISTORY_SIZE:
+                            dotbot.position_history.pop(0)
                 need_update = True
 
             if dotbot.battery != frame.packet.payload.battery / 1000.0:
                 dotbot.battery = frame.packet.payload.battery / 1000.0  # mV to V
+                need_update = True
+
+            if dotbot.mode != ControlModeType(frame.packet.payload.mode):
+                dotbot.mode = ControlModeType(frame.packet.payload.mode)
                 need_update = True
 
             self.logger.debug(
@@ -650,6 +450,8 @@ class Controller:
         if self.settings.verbose is True:
             print(frame)
         self.dotbots.update({dotbot.address: dotbot})
+        if notification_cmd != DotBotNotificationCommand.NEW_DOTBOT:
+            notification.data = DotBotModel(**dotbot.model_dump(exclude_none=True))
         if notification_cmd != DotBotNotificationCommand.NONE:
             asyncio.create_task(self.notify_clients(notification))
 
@@ -657,8 +459,17 @@ class Controller:
         """Safely send a message to a websocket client."""
         try:
             await websocket.send_text(msg)
-        except websockets.exceptions.ConnectionClosedError:
-            await asyncio.sleep(0.1)
+        except (
+            websockets.exceptions.ConnectionClosedError,
+            RuntimeError,
+            starlette.websockets.WebSocketDisconnect,
+        ) as exc:
+            self.logger.warning(
+                "Failed to send message to websocket client",
+                error=str(exc),
+            )
+            if websocket in self.websockets:
+                self.websockets.remove(websocket)
 
     async def notify_clients(self, notification):
         """Send a message to all clients connected."""
@@ -671,7 +482,6 @@ class Controller:
                 for websocket in self.websockets
             ]
         )
-        self.qrkey.publish("/notify", notification.model_dump(exclude_none=True))
 
     def send_payload(self, destination: int, payload: Payload):
         """Sends a command in an HDLC frame over serial."""
@@ -693,19 +503,60 @@ class Controller:
         """Returns the list of dotbots matching the query."""
         dotbots: List[DotBotModel] = []
         for dotbot in self.dotbots.values():
+            if query.address is not None and dotbot.address != query.address:
+                continue
             if (
                 query.application is not None
-                and dotbot.application != query.application
+                and dotbot.application.value != query.application
             ):
                 continue
-            if query.mode is not None and dotbot.mode != query.mode:
+            if query.status is not None and dotbot.status.value != query.status:
                 continue
-            if query.status is not None and dotbot.status != query.status:
+            if query.max_battery is not None and dotbot.battery is not None:
+                if dotbot.battery > query.max_battery:
+                    continue
+            if query.min_battery is not None and dotbot.battery is not None:
+                if dotbot.battery < query.min_battery:
+                    continue
+            if (
+                any(
+                    [
+                        query.max_position_x is not None,
+                        query.min_position_x is not None,
+                        query.max_position_y is not None,
+                        query.min_position_y is not None,
+                    ]
+                )
+                and dotbot.lh2_position is None
+            ):
                 continue
+            if dotbot.lh2_position is None and query.max_positions is not None:
+                continue
+            if dotbot.lh2_position is not None:
+                if query.max_position_x is not None:
+                    if query.max_position_x < dotbot.lh2_position.x:
+                        continue
+                if query.min_position_x is not None:
+                    if query.min_position_x > dotbot.lh2_position.x:
+                        continue
+                if query.max_position_y is not None:
+                    if query.max_position_y < dotbot.lh2_position.y:
+                        continue
+                if query.min_position_y is not None:
+                    if query.min_position_y > dotbot.lh2_position.y:
+                        continue
             _dotbot = DotBotModel(**dotbot.model_dump())
-            _dotbot.position_history = _dotbot.position_history[: query.max_positions]
+            max_positions = (
+                MAX_POSITION_HISTORY_SIZE
+                if query.max_positions is None
+                else query.max_positions
+            )
+            _dotbot.position_history = _dotbot.position_history[:max_positions]
             dotbots.append(_dotbot)
-        return sorted(dotbots, key=lambda dotbot: dotbot.address)
+        dotbots = sorted(dotbots, key=lambda dotbot: dotbot.address)
+        if query.limit is not None:
+            dotbots = dotbots[: query.limit]
+        return dotbots
 
     async def web(self):
         """Starts the web server application."""
@@ -759,13 +610,8 @@ class Controller:
     async def run(self):
         """Launch the controller."""
         tasks = []
-        self.qrkey = QrkeyController(self.on_request, LOGGER, root_topic="/pydotbot")
         try:
             tasks = [
-                asyncio.create_task(
-                    name="QrKey controller",
-                    coro=self.qrkey.start(subscriptions=self.subscriptions),
-                ),
                 asyncio.create_task(name="Web server", coro=self.web()),
                 asyncio.create_task(name="Web browser", coro=self._open_webbrowser()),
                 asyncio.create_task(

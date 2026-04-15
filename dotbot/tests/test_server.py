@@ -12,6 +12,10 @@ from dotbot.models import (
     DotBotModel,
     DotBotMoveRawCommandModel,
     DotBotRgbLedCommandModel,
+    DotBotWaypoints,
+    WSMoveRaw,
+    WSRgbLed,
+    WSWaypoints,
 )
 from dotbot.protocol import (
     ApplicationType,
@@ -160,7 +164,7 @@ async def test_set_dotbots_rgb_led(dotbots, code, found):
             },
             False,
             ApplicationType.DotBot,
-            {"threshold": 10, "waypoints": [{"x": 0.5, "y": 0.1, "z": 0}]},
+            {"threshold": 100, "waypoints": [{"x": 500, "y": 100}]},
             200,
             True,
             id="dotbot_found",
@@ -172,12 +176,12 @@ async def test_set_dotbots_rgb_led(dotbots, code, found):
                     application=ApplicationType.DotBot,
                     swarm="0000",
                     last_seen=123.4,
-                    lh2_position=DotBotLH2Position(x=0.1, y=0.5, z=0),
+                    lh2_position=DotBotLH2Position(x=100, y=500),
                 ),
             },
             True,
             ApplicationType.DotBot,
-            {"threshold": 10, "waypoints": [{"x": 0.5, "y": 0.1, "z": 0}]},
+            {"threshold": 100, "waypoints": [{"x": 500, "y": 100}]},
             200,
             True,
             id="dotbot_with_position_found",
@@ -193,7 +197,7 @@ async def test_set_dotbots_rgb_led(dotbots, code, found):
             },
             False,
             ApplicationType.DotBot,
-            {"threshold": 10, "waypoints": [{"x": 0.5, "y": 0.1, "z": 0}]},
+            {"threshold": 100, "waypoints": [{"x": 500, "y": 100}]},
             404,
             False,
             id="dotbot_not_found",
@@ -270,18 +274,18 @@ async def test_set_dotbots_waypoints(
             expected_waypoints = [DotBotGPSPosition(latitude=0.5, longitude=0.1)]
     else:  # DotBot application
         payload = PayloadLH2Waypoints(
-            threshold=10,
+            threshold=100,
             count=1,
-            waypoints=[PayloadLH2Location(pos_x=500000, pos_y=100000, pos_z=0)],
+            waypoints=[PayloadLH2Location(pos_x=500, pos_y=100)],
         )
-        expected_threshold = 10
+        expected_threshold = 100
         if has_position is True:
             expected_waypoints = [
-                DotBotLH2Position(x=0.1, y=0.5, z=0),
-                DotBotLH2Position(x=0.5, y=0.1, z=0),
+                DotBotLH2Position(x=100, y=500),
+                DotBotLH2Position(x=500, y=100),
             ]
         else:
-            expected_waypoints = [DotBotLH2Position(x=0.5, y=0.1, z=0)]
+            expected_waypoints = [DotBotLH2Position(x=500, y=100)]
 
     response = await client.put(
         f"/controller/dotbots/{address}/{application.value}/waypoints",
@@ -436,8 +440,8 @@ async def test_get_dotbot(dotbots, address, code, found, result):
                     swarm="0000",
                     last_seen=123.4,
                     position_history=[
-                        DotBotLH2Position(x=0.0, y=0.5, z=0.0),
-                        DotBotLH2Position(x=0.5, y=0.5, z=0.0),
+                        DotBotLH2Position(x=0.0, y=0.5),
+                        DotBotLH2Position(x=0.5, y=0.5),
                     ],
                 ),
                 "12345": DotBotModel(
@@ -446,8 +450,8 @@ async def test_get_dotbot(dotbots, address, code, found, result):
                     swarm="0000",
                     last_seen=123.4,
                     position_history=[
-                        DotBotLH2Position(x=0.5, y=0.5, z=0.0),
-                        DotBotLH2Position(x=0.5, y=0.0, z=0.0),
+                        DotBotLH2Position(x=0.5, y=0.5),
+                        DotBotLH2Position(x=0.5, y=0.0),
                     ],
                 ),
             },
@@ -609,3 +613,161 @@ async def test_reverse_proxy_middleware_connect_error(monkeypatch):
 #     serve.side_effect = asyncio.exceptions.CancelledError()
 #     await web(None)
 #     assert "Web server cancelled" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "dotbots,ws_message,expected_payload,should_call",
+    [
+        pytest.param(
+            # ---- RGB LED (valid) ----
+            {
+                "4242": DotBotModel(
+                    address="4242",
+                    application=ApplicationType.DotBot,
+                    swarm="0000",
+                    last_seen=123.4,
+                )
+            },
+            WSRgbLed(
+                cmd="rgb_led",
+                address="4242",
+                application=ApplicationType.DotBot,
+                data=DotBotRgbLedCommandModel(
+                    red=255,
+                    green=0,
+                    blue=128,
+                ),
+            ),
+            PayloadCommandRgbLed(red=255, green=0, blue=128),
+            True,
+            id="rgb_led_valid",
+        ),
+        pytest.param(
+            # ---- WAYPOINTS (valid) ----
+            {
+                "4242": DotBotModel(
+                    address="4242",
+                    application=ApplicationType.DotBot,
+                    swarm="0000",
+                    last_seen=123.4,
+                )
+            },
+            WSWaypoints(
+                cmd="waypoints",
+                address="4242",
+                application=ApplicationType.DotBot,
+                data=DotBotWaypoints(
+                    threshold=10,
+                    waypoints=[DotBotLH2Position(x=500, y=100)],
+                ),
+            ),
+            PayloadLH2Waypoints(
+                threshold=10,
+                count=1,
+                waypoints=[PayloadLH2Location(pos_x=500, pos_y=100)],
+            ),
+            True,
+            id="waypoints_valid",
+        ),
+        pytest.param(
+            # ---- MOVE_RAW (valid) ----
+            {
+                "4242": DotBotModel(
+                    address="4242",
+                    application=ApplicationType.DotBot,
+                    swarm="0000",
+                    last_seen=123.4,
+                )
+            },
+            WSMoveRaw(
+                cmd="move_raw",
+                address="4242",
+                application=ApplicationType.DotBot,
+                data=DotBotMoveRawCommandModel(
+                    left_x=0,
+                    left_y=100,
+                    right_x=0,
+                    right_y=100,
+                ),
+            ),
+            PayloadCommandMoveRaw(
+                left_x=0,
+                left_y=100,
+                right_x=0,
+                right_y=100,
+            ),
+            True,
+            id="move_raw_valid",
+        ),
+        pytest.param(
+            # ---- UNKNOWN ADDRESS (ignored) ----
+            {},
+            WSRgbLed(
+                cmd="rgb_led",
+                address="4242",
+                application=ApplicationType.DotBot,
+                data=DotBotRgbLedCommandModel(
+                    red=255,
+                    green=0,
+                    blue=128,
+                ),
+            ),
+            None,
+            False,
+            id="address_not_found",
+        ),
+    ],
+)
+def test_ws_dotbots_commands(
+    dotbots,
+    ws_message,
+    expected_payload,
+    should_call,
+):
+    api.controller.dotbots = dotbots
+
+    with TestClient(api).websocket_connect("/controller/ws/dotbots") as ws:
+        ws.send_json(ws_message.model_dump())
+
+    if should_call:
+        api.controller.send_payload.assert_called()
+        if expected_payload is not None:
+            api.controller.send_payload.assert_called_with(
+                int(ws_message.address, 16),
+                expected_payload,
+            )
+    else:
+        api.controller.send_payload.assert_not_called()
+
+
+def test_ws_invalid_message_validation_error():
+    api.controller.dotbots = {
+        "4242": DotBotModel(
+            address="4242",
+            application=ApplicationType.DotBot,
+            swarm="0000",
+            last_seen=123.4,
+        )
+    }
+
+    invalid_message = {
+        # cmd doesn't match with data
+        "cmd": "waypoints",
+        "address": "4242",
+        "data": {
+            "red": 255,
+            "green": 0,
+            "blue": 0,
+        },
+    }
+
+    with TestClient(api).websocket_connect("/controller/ws/dotbots") as ws:
+        ws.send_json(invalid_message)
+
+        response = ws.receive_json()
+
+    assert response["error"] == "invalid_message"
+    assert "details" in response
+    assert isinstance(response["details"], list)
+
+    api.controller.send_payload.assert_not_called()

@@ -3,25 +3,25 @@
 
 [[dotbots]]
 address = "BADCAFE111111111" # DotBot unique address
-calibrated = true # optional, defaults to true
-pos_x = 200_000 # [0, 1_000_000]
-pos_y = 200_000 # [0, 1_000_000]
-theta = 0.0 # [0.0, 2pi]
+calibrated = 0xff # optional, defaults to only first lighthouse calibrated
+pos_x = 400 # [0, 2_000] in mm
+pos_y = 400 # [0, 2_000]
+direction = 0 # [0, 360] in degrees, 0 is facing north, increasing clockwise
 
 [[dotbots]]
 address = "DEADBEEF22222222"
-pos_x = 200_000
-pos_y = 100_000
-theta = 1.57
+pos_x = 400
+pos_y = 200
+direction = 180
 
 [[dotbots]]
 address = "B0B0F00D33333333"
-pos_x = 1_000_000
-pos_y = 1_000_000
-theta = 1.57
+pos_x = 1_500
+pos_y = 1_500
+direction = 180
 
 [[dotbots]]
 address = "BADC0DE444444444"
-pos_x = 500_000
-pos_y = 500_000
-theta = 3.14
+pos_x = 1_000
+pos_y = 1_000
+direction = 360

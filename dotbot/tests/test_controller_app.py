@@ -26,22 +26,29 @@ Options:
                                   localhost.
   -P, --mqtt-port INTEGER         MQTT port used by cloud adapter. Default:
                                   1883.
-  -T, --mqtt-use_tls              Use TLS with MQTT (for cloud adapter).
-  -d, --dotbot-address TEXT       Address in hex of the DotBot to control.
-                                  Defaults to FFFFFFFFFFFFFFFF
+  -T, --mqtt-use_tls / --no-mqtt-use_tls
+                                  Use TLS with MQTT (for cloud adapter).
   -g, --gw-address TEXT           Gateway address in hex. Defaults to
                                   0000000000000000
   -s, --network-id TEXT           Network ID in hex. Defaults to 0000
   -c, --controller-http-port INTEGER
                                   Controller HTTP port of the REST API. Defaults
                                   to '8000'
-  -w, --webbrowser                Open a web browser automatically
+  -w, --webbrowser / --no-webbrowser
+                                  Open a web browser automatically
   -v, --verbose                   Run in verbose mode (all payloads received are
                                   printed in terminal)
   --log-level [debug|info|warning|error]
                                   Logging level. Defaults to info
   --log-output PATH               Filename where logs are redirected
   --config-path FILE              Path to a .toml configuration file.
+  -m, --map-size TEXT             Map size in mm. Defaults to '2000x2000'
+  -M, --background-map FILE       Path to a background map image file in png
+                                  format. The image shouldbe a top-down view of
+                                  the environment, with 1024 pixels width and a
+                                  height proportional to the real map size. The
+                                  map size should be set with the --map-size
+                                  option (default: 2000x2000).
   --help                          Show this message and exit.
 """
 
@@ -55,10 +62,9 @@ def test_main_help():
 
 
 @patch("dotbot_utils.serial_interface.serial.Serial.open")
-@patch("dotbot.controller.QrkeyController")
 @patch("dotbot.version")
 @patch("dotbot.controller.Controller.run")
-def test_main(run, version, _, __):
+def test_main(run, version, _):
     version.return_value = "test"
     runner = CliRunner()
     result = runner.invoke(main)
@@ -73,9 +79,8 @@ def test_main(run, version, _, __):
 
 
 @patch("dotbot_utils.serial_interface.serial.Serial.open")
-@patch("dotbot.controller.QrkeyController")
 @patch("dotbot.controller.Controller.run")
-def test_main_interrupts(run, _, __):
+def test_main_interrupts(run, _):
     runner = CliRunner()
     run.side_effect = KeyboardInterrupt
     result = runner.invoke(main)
@@ -94,9 +99,8 @@ def test_main_interrupts(run, _, __):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Doesn't work on Windows")
 @patch("dotbot_utils.serial_interface.serial.Serial.open")
-@patch("dotbot.controller.QrkeyController")
 @patch("dotbot.controller_app.Controller")
-def test_main_with_config(controller, _, __, tmp_path):
+def test_main_with_config(controller, _, tmp_path):
     log_file = tmp_path / "logfile.log"
     config_file = tmp_path / "config.toml"
     config_file.write_text(

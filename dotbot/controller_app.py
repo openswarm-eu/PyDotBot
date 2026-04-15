@@ -17,8 +17,8 @@ import toml
 from dotbot import (
     CONTROLLER_ADAPTER_DEFAULT,
     CONTROLLER_HTTP_PORT_DEFAULT,
-    DOTBOT_ADDRESS_DEFAULT,
     GATEWAY_ADDRESS_DEFAULT,
+    MAP_SIZE_DEFAULT,
     MQTT_HOST_DEFAULT,
     MQTT_PORT_DEFAULT,
     NETWORK_ID_DEFAULT,
@@ -65,15 +65,9 @@ from dotbot.logger import setup_logging
 )
 @click.option(
     "-T",
-    "--mqtt-use_tls",
-    is_flag=True,
+    "--mqtt-use_tls/--no-mqtt-use_tls",
+    default=None,
     help="Use TLS with MQTT (for cloud adapter).",
-)
-@click.option(
-    "-d",
-    "--dotbot-address",
-    type=str,
-    help=f"Address in hex of the DotBot to control. Defaults to {DOTBOT_ADDRESS_DEFAULT:>0{16}}",
 )
 @click.option(
     "-g",
@@ -95,8 +89,8 @@ from dotbot.logger import setup_logging
 )
 @click.option(
     "-w",
-    "--webbrowser",
-    is_flag=True,
+    "--webbrowser/--no-webbrowser",
+    default=None,
     help="Open a web browser automatically",
 )
 @click.option(
@@ -120,6 +114,23 @@ from dotbot.logger import setup_logging
     type=click.Path(exists=True, dir_okay=False),
     help="Path to a .toml configuration file.",
 )
+@click.option(
+    "-m",
+    "--map-size",
+    type=str,
+    help=f"Map size in mm. Defaults to '{MAP_SIZE_DEFAULT}'",
+)
+@click.option(
+    "-M",
+    "--background-map",
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        f"Path to a background map image file in png format. The image should"
+        "be a top-down view of the environment, with 1024 pixels width and a "
+        "height proportional to the real map size. The map size should be set "
+        f"with the --map-size option (default: {MAP_SIZE_DEFAULT})."
+    ),
+)
 def main(
     adapter,
     port,
@@ -127,10 +138,11 @@ def main(
     mqtt_host,
     mqtt_port,
     mqtt_use_tls,
-    dotbot_address,
     gw_address,
     network_id,
     controller_http_port,
+    map_size,
+    background_map,
     webbrowser,
     verbose,
     log_level,
@@ -149,10 +161,11 @@ def main(
         "mqtt_host": mqtt_host,
         "mqtt_port": mqtt_port,
         "mqtt_use_tls": mqtt_use_tls,
-        "dotbot_address": dotbot_address,
         "gw_address": gw_address,
         "network_id": network_id,
         "controller_http_port": controller_http_port,
+        "map_size": map_size,
+        "background_map": background_map,
         "webbrowser": webbrowser,
         "verbose": verbose,
         "log_level": log_level,
@@ -164,7 +177,7 @@ def main(
         file_data = toml.load(config_path)
         data.update(file_data)
 
-    data.update({k: v for k, v in cli_args.items() if v not in (None, False)})
+    data.update({k: v for k, v in cli_args.items() if v is not None})
 
     controller_settings = ControllerSettings(**data)
 

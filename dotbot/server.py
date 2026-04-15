@@ -5,26 +5,42 @@
 
 """Module for the web server application."""
 
+import base64
 import os
-from typing import List
+from typing import Annotated, List
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import TypeAdapter, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from dotbot import pydotbot_version
 from dotbot.logger import LOGGER
 from dotbot.models import (
+    MAX_POSITION_HISTORY_SIZE,
+    DotBotBackgroundMapModel,
+    DotBotMapSizeModel,
     DotBotModel,
     DotBotMoveRawCommandModel,
     DotBotNotificationCommand,
     DotBotNotificationModel,
+    DotBotNotificationUpdate,
     DotBotQueryModel,
     DotBotRgbLedCommandModel,
     DotBotWaypoints,
+    WSMessage,
+    WSMoveRaw,
+    WSRgbLed,
+    WSWaypoints,
 )
 from dotbot.protocol import (
     ApplicationType,
@@ -39,6 +55,8 @@ from dotbot.protocol import (
 PYDOTBOT_FRONTEND_BASE_URL = os.getenv(
     "PYDOTBOT_FRONTEND_BASE_URL", "https://dotbots.github.io/PyDotBot"
 )
+
+ws_adapter = TypeAdapter(WSMessage)
 
 
 class ReverseProxyMiddleware(BaseHTTPMiddleware):
@@ -98,6 +116,10 @@ async def dotbots_move_raw(
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
 
+    _dotbots_move_raw(address=address, command=command)
+
+
+def _dotbots_move_raw(address: str, command: DotBotMoveRawCommandModel):
     payload = PayloadCommandMoveRaw(
         left_x=command.left_x,
         left_y=command.left_y,
@@ -119,12 +141,20 @@ async def dotbots_rgb_led(
     """Set the current active DotBot."""
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
+    await _dotbots_rgb_led(address=address, command=command)
 
+
+async def _dotbots_rgb_led(address: str, command: DotBotRgbLedCommandModel):
     payload = PayloadCommandRgbLed(
         red=command.red, green=command.green, blue=command.blue
     )
     api.controller.send_payload(int(address, 16), payload)
     api.controller.dotbots[address].rgb_led = command
+    notification = DotBotNotificationModel(
+        cmd=DotBotNotificationCommand.UPDATE,
+        data=DotBotNotificationUpdate(address=address, rgb_led=command),
+    )
+    await api.controller.notify_clients(notification)
 
 
 @api.put(
@@ -141,6 +171,16 @@ async def dotbots_waypoints(
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
 
+    await _dotbots_waypoints(
+        address=address, application=application, waypoints=waypoints
+    )
+
+
+async def _dotbots_waypoints(
+    address: str,
+    application: int,
+    waypoints: DotBotWaypoints,
+):
     waypoints_list = waypoints.waypoints
     if application == ApplicationType.SailBot.value:
         if api.controller.dotbots[address].gps_position is not None:
@@ -158,6 +198,11 @@ async def dotbots_waypoints(
                 for waypoint in waypoints.waypoints
             ],
         )
+        update_data = DotBotNotificationUpdate(
+            address=address,
+            gps_waypoints=waypoints_list,
+            waypoints_threshold=waypoints.threshold,
+        )
     else:  # DotBot application
         if api.controller.dotbots[address].lh2_position is not None:
             waypoints_list = [
@@ -168,19 +213,24 @@ async def dotbots_waypoints(
             count=len(waypoints.waypoints),
             waypoints=[
                 PayloadLH2Location(
-                    pos_x=int(waypoint.x * 1e6),
-                    pos_y=int(waypoint.y * 1e6),
-                    pos_z=int(waypoint.z * 1e6),
+                    pos_x=int(waypoint.x),
+                    pos_y=int(waypoint.y),
                 )
                 for waypoint in waypoints.waypoints
             ],
         )
+        update_data = DotBotNotificationUpdate(
+            address=address,
+            lh2_waypoints=waypoints_list,
+            waypoints_threshold=waypoints.threshold,
+        )
     api.controller.dotbots[address].waypoints = waypoints_list
     api.controller.dotbots[address].waypoints_threshold = waypoints.threshold
     api.controller.send_payload(int(address, 16), payload)
-    await api.controller.notify_clients(
-        DotBotNotificationModel(cmd=DotBotNotificationCommand.RELOAD)
+    notification = DotBotNotificationModel(
+        cmd=DotBotNotificationCommand.UPDATE, data=update_data
     )
+    await api.controller.notify_clients(notification)
 
 
 @api.delete(
@@ -193,6 +243,12 @@ async def dotbot_positions_history_clear(address: str):
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
     api.controller.dotbots[address].position_history = []
+    await api.controller.notify_clients(
+        DotBotNotificationModel(
+            cmd=DotBotNotificationCommand.UPDATE,
+            data=DotBotNotificationUpdate(address=address, position_history=[]),
+        )
+    )
 
 
 @api.get(
@@ -202,12 +258,12 @@ async def dotbot_positions_history_clear(address: str):
     summary="Return information about a dotbot given its address",
     tags=["dotbots"],
 )
-async def dotbot(address: str, query: DotBotQueryModel = Depends()):
+async def dotbot(address: str, max_positions: int = MAX_POSITION_HISTORY_SIZE):
     """Dotbot HTTP GET handler."""
     if address not in api.controller.dotbots:
         raise HTTPException(status_code=404, detail="No matching dotbot found")
     _dotbot = DotBotModel(**api.controller.dotbots[address].model_dump())
-    _dotbot.position_history = _dotbot.position_history[: query.max_positions]
+    _dotbot.position_history = _dotbot.position_history[:max_positions]
     return _dotbot
 
 
@@ -218,9 +274,36 @@ async def dotbot(address: str, query: DotBotQueryModel = Depends()):
     summary="Return the list of available dotbots",
     tags=["dotbots"],
 )
-async def dotbots(query: DotBotQueryModel = Depends()):
+async def dotbots(query: Annotated[DotBotQueryModel, Query()]):
     """Dotbots HTTP GET handler."""
     return api.controller.get_dotbots(query)
+
+
+@api.get(
+    path="/controller/map_size",
+    response_model=DotBotMapSizeModel,
+    response_model_exclude_none=True,
+    summary="Return the map size of the controller",
+    tags=["controller"],
+)
+async def map_size():
+    """Map size HTTP GET handler."""
+    return api.controller.map_size
+
+
+@api.get(
+    path="/controller/background_map",
+    response_model=DotBotBackgroundMapModel,
+    summary="Return the background map of the controller",
+    tags=["controller"],
+)
+async def background_map():
+    """Background map HTTP GET handler."""
+    if not api.controller.settings.background_map:
+        return DotBotBackgroundMapModel(data="")
+    with open(api.controller.settings.background_map, "rb") as f:
+        encoded_string = base64.b64encode(f.read()).decode("utf-8")
+    return DotBotBackgroundMapModel(data=encoded_string)
 
 
 @api.websocket("/controller/ws/status")
@@ -234,6 +317,49 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         if websocket in api.controller.websockets:
             api.controller.websockets.remove(websocket)
+
+
+@api.websocket("/controller/ws/dotbots")
+async def ws_dotbots(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            raw = await websocket.receive_json()
+
+            try:
+                msg = ws_adapter.validate_python(raw)
+            except ValidationError as e:
+                await websocket.send_json(
+                    {
+                        "error": "invalid_message",
+                        "details": e.errors(),
+                    }
+                )
+                continue
+
+            if msg.address not in api.controller.dotbots:
+                # ignore messages where address doesn't exist
+                continue
+
+            if isinstance(msg, WSRgbLed):
+                await _dotbots_rgb_led(
+                    address=msg.address,
+                    command=msg.data,
+                )
+            elif isinstance(msg, WSMoveRaw):
+                _dotbots_move_raw(
+                    address=msg.address,
+                    command=msg.data,
+                )
+            elif isinstance(msg, WSWaypoints):
+                await _dotbots_waypoints(
+                    address=msg.address,
+                    application=msg.application,
+                    waypoints=msg.data,
+                )
+
+    except WebSocketDisconnect:
+        LOGGER.debug("WebSocket client disconnected")
 
 
 # Mount static files after all routes are defined
